@@ -131,13 +131,15 @@ public class DashChunkSource implements ChunkSource {
   @Override
   public final void getChunkOperation(List<? extends MediaChunk> queue, long seekPositionUs,
       long playbackPositionUs, ChunkOperationHolder out) {
+    // *** find proper video format by adaptation logic
     evaluation.queueSize = queue.size();
     if (evaluation.format == null || !lastChunkWasInitialization) {
       evaluator.evaluate(queue, playbackPositionUs, formats, evaluation);
     }
     Format selectedFormat = evaluation.format;
     out.queueSize = evaluation.queueSize;
-
+    
+    // *** error handling
     if (selectedFormat == null) {
       out.chunk = null;
       return;
@@ -151,6 +153,7 @@ public class DashChunkSource implements ChunkSource {
     Representation selectedRepresentation = representations.get(selectedFormat.id);
     Extractor extractor = extractors.get(selectedRepresentation.format.id);
 
+    // *** if a new format is requested, download initialization/index request first
     RangedUri pendingInitializationUri = null;
     RangedUri pendingIndexUri = null;
     if (extractor.getFormat() == null) {
@@ -168,6 +171,7 @@ public class DashChunkSource implements ChunkSource {
       return;
     }
 
+    // *** find the right segment number to download
     int nextSegmentNum;
     DashSegmentIndex segmentIndex = segmentIndexes.get(selectedRepresentation.format.id);
     if (queue.isEmpty()) {
@@ -181,6 +185,7 @@ public class DashChunkSource implements ChunkSource {
       return;
     }
 
+    // *** download video chunk
     Chunk nextMediaChunk = newMediaChunk(selectedRepresentation, segmentIndex, extractor,
         dataSource, nextSegmentNum, evaluation.trigger);
     lastChunkWasInitialization = false;

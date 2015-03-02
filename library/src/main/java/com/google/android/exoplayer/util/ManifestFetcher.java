@@ -19,9 +19,12 @@ import com.google.android.exoplayer.ParserException;
 
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.util.Log;
 
+import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
@@ -57,6 +60,7 @@ public abstract class ManifestFetcher<T> extends AsyncTask<String, Void, T> {
 
   }
 
+  public static final String TAG = "ManifestFetcher";
   public static final int DEFAULT_HTTP_TIMEOUT_MILLIS = 8000;
 
   private final ManifestCallback<T> callback;
@@ -85,9 +89,44 @@ public abstract class ManifestFetcher<T> extends AsyncTask<String, Void, T> {
   protected final T doInBackground(String... data) {
     try {
       contentId = data.length > 1 ? data[1] : null;
-      String urlString = data[0];
+//      String urlString = data[0];
+      String urlString = "https://www.youtube.com/watch?v=" + contentId;
       String inputEncoding = null;
       InputStream inputStream = null;
+      
+      try {
+        Uri originVideoUrl = Uri.parse(urlString);
+        HttpURLConnection connMpd = configureHttpConnection(new URL(urlString), "curl/7.35.0");
+        if (connMpd.getResponseCode() == HttpURLConnection.HTTP_OK) {
+          inputStream = connMpd.getInputStream();
+          //inputEncoding = connMpd.getContentEncoding();
+          BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
+          String line;
+          while ((line = reader.readLine()) != null) {
+//            Log.e(TAG, line);
+            String pattern = "\"dashmpd\":\"";
+            int start = line.indexOf(pattern);
+            if (start != -1) {
+              start += pattern.length();
+              int end = line.indexOf("\"", start);
+//              Log.e(TAG, "Start:" + start + ", End:" + end);
+              String dashMpdStr = line.substring(start, end);
+              Log.e(TAG, dashMpdStr);
+              urlString = dashMpdStr.replace("\\", ""); 
+              break;
+            }
+          }
+        }
+        else {
+          return null;
+        }
+      } finally {
+        if (inputStream != null) {
+          inputStream.close();
+        }
+      }
+      
+      
       try {
         Uri baseUrl = Util.parseBaseUri(urlString);
         HttpURLConnection connection = configureHttpConnection(new URL(urlString));
@@ -138,4 +177,13 @@ public abstract class ManifestFetcher<T> extends AsyncTask<String, Void, T> {
     return connection;
   }
 
+  private HttpURLConnection configureHttpConnection(URL url, String userAgent) throws IOException {
+    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+    connection.setRequestProperty("User-Agent", userAgent);
+    connection.setConnectTimeout(timeoutMillis);
+    connection.setReadTimeout(timeoutMillis);
+    connection.setDoOutput(false);
+    connection.connect();
+    return connection;
+  }
 }

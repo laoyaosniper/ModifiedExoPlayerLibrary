@@ -17,6 +17,7 @@ package com.google.android.exoplayer.chunk;
 
 
 import android.os.Handler;
+import android.os.SystemClock;
 import android.util.Log;
 
 import com.google.android.exoplayer.upstream.BandwidthMeter;
@@ -176,19 +177,19 @@ public interface FormatEvaluator {
     public static final int DEFAULT_MIN_DURATION_TO_RETAIN_AFTER_DISCARD_MS = 25000;
     public static final float DEFAULT_BANDWIDTH_FRACTION = 0.75f;
 
-    private final BandwidthMeter bandwidthMeter;
+    protected final BandwidthMeter bandwidthMeter;
 
-    private final int maxInitialBitrate;
-    private final long minDurationForQualityIncreaseUs;
-    private final long maxDurationForQualityDecreaseUs;
-    private final long minDurationToRetainAfterDiscardUs;
-    private final float bandwidthFraction;
+    protected final int maxInitialBitrate;
+    protected final long minDurationForQualityIncreaseUs;
+    protected final long maxDurationForQualityDecreaseUs;
+    protected final long minDurationToRetainAfterDiscardUs;
+    protected final float bandwidthFraction;
     
-    private long videoDurationUs;
-    private final Handler eventHandler;
-    private final EventListener eventListener;
-    private HashMap<Long, Long> chunksByte;
-    private boolean allChunksLoaded;
+    protected long videoDurationUs;
+    protected final Handler eventHandler;
+    protected final EventListener eventListener;
+    protected HashMap<Long, Long> chunksByte;
+    protected boolean allChunksLoaded;
     
     
     public interface EventListener {
@@ -358,6 +359,228 @@ public interface FormatEvaluator {
 
   }
   
+
+  
+  /**
+   * An adaptive evaluator for video formats, which attempts to select the best quality possible
+   * given the current network conditions and state of the buffer.
+   * <p>
+   * This implementation should be used for video only, and should not be used for audio. It is a
+   * reference implementation only. It is recommended that application developers implement their
+   * own adaptive evaluator to more precisely suit their use case.
+   */
+  public static class ScaledAdaptiveEvaluator implements FormatEvaluator {
+
+    public static final int DEFAULT_MAX_INITIAL_BITRATE = 800000;
+
+    public static final int DEFAULT_MIN_DURATION_FOR_QUALITY_INCREASE_MS = 10000;
+    public static final int DEFAULT_MAX_DURATION_FOR_QUALITY_DECREASE_MS = 25000;
+    public static final int DEFAULT_MIN_DURATION_TO_RETAIN_AFTER_DISCARD_MS = 25000;
+    public static final float DEFAULT_BANDWIDTH_FRACTION = 0.75f;
+
+    private final BandwidthMeter bandwidthMeter;
+
+    private final int maxInitialBitrate;
+    private final long minDurationForQualityIncreaseUs;
+    private final long maxDurationForQualityDecreaseUs;
+    private final long minDurationToRetainAfterDiscardUs;
+    private final float bandwidthFraction;
+    
+    private long videoDurationUs;
+    private final Handler eventHandler;
+    private final EventListener eventListener;
+    private HashMap<Long, Long> chunksByte;
+    private boolean allChunksLoaded;
+    
+    private double scale;
+    
+    public interface EventListener {
+      void onAllChunksDownloaded(long totalBytes);
+    }
+
+    /**
+     * @param bandwidthMeter Provides an estimate of the currently available bandwidth.
+     */
+    public ScaledAdaptiveEvaluator(BandwidthMeter bandwidthMeter, double scale, long videoDurationMs, Handler eventHandler, EventListener eventListener) {
+      this (bandwidthMeter, DEFAULT_MAX_INITIAL_BITRATE,
+        DEFAULT_MIN_DURATION_FOR_QUALITY_INCREASE_MS,
+        DEFAULT_MAX_DURATION_FOR_QUALITY_DECREASE_MS,
+        DEFAULT_MIN_DURATION_TO_RETAIN_AFTER_DISCARD_MS, DEFAULT_BANDWIDTH_FRACTION, eventHandler, eventListener);
+      this.videoDurationUs=videoDurationMs*1000;
+      this.scale = scale;
+      this.chunksByte= new HashMap<Long, Long>();
+      this.allChunksLoaded=false;
+      
+      
+    }
+
+    /**
+     * @param bandwidthMeter Provides an estimate of the currently available bandwidth.
+     * @param maxInitialBitrate The maximum bitrate in bits per second that should be assumed
+     *     when bandwidthMeter cannot provide an estimate due to playback having only just started.
+     * @param minDurationForQualityIncreaseMs The minimum duration of buffered data required for
+     *     the evaluator to consider switching to a higher quality format.
+     * @param maxDurationForQualityDecreaseMs The maximum duration of buffered data required for
+     *     the evaluator to consider switching to a lower quality format.
+     * @param minDurationToRetainAfterDiscardMs When switching to a significantly higher quality
+     *     format, the evaluator may discard some of the media that it has already buffered at the
+     *     lower quality, so as to switch up to the higher quality faster. This is the minimum
+     *     duration of media that must be retained at the lower quality.
+     * @param bandwidthFraction The fraction of the available bandwidth that the evaluator should
+     *     consider available for use. Setting to a value less than 1 is recommended to account
+     *     for inaccuracies in the bandwidth estimator.
+     */
+    public ScaledAdaptiveEvaluator(BandwidthMeter bandwidthMeter,
+        int maxInitialBitrate,
+        int minDurationForQualityIncreaseMs,
+        int maxDurationForQualityDecreaseMs,
+        int minDurationToRetainAfterDiscardMs,
+        float bandwidthFraction, 
+        Handler eventHandler, 
+        EventListener eventListener) {
+      this.eventHandler=eventHandler;
+      this.eventListener=eventListener;
+      this.bandwidthMeter = bandwidthMeter;
+      this.maxInitialBitrate = maxInitialBitrate;
+      this.minDurationForQualityIncreaseUs = minDurationForQualityIncreaseMs * 1000L;
+      this.maxDurationForQualityDecreaseUs = maxDurationForQualityDecreaseMs * 1000L;
+      this.minDurationToRetainAfterDiscardUs = minDurationToRetainAfterDiscardMs * 1000L;
+      this.bandwidthFraction = bandwidthFraction;
+    }
+
+    @Override
+    public void enable() {
+      // Do nothing.
+    }
+
+    @Override
+    public void disable() {
+      // Do nothing.
+    }
+
+    @Override
+    public void evaluate(List<? extends MediaChunk> queue, long playbackPositionUs,
+        Format[] formats, Evaluation evaluation) {
+      long bufferedDurationUs = queue.isEmpty() ? 0
+          : queue.get(queue.size() - 1).endTimeUs - playbackPositionUs;
+      
+      long bufferedEndTimeUs = queue.isEmpty() ? 0
+          : queue.get(queue.size() - 1).endTimeUs;
+      
+      for(int i=0;i<queue.size();i++){
+        if(!chunksByte.containsKey(queue.get(i).startTimeUs)){
+          chunksByte.put(queue.get(i).startTimeUs, queue.get(i).bytesLoaded());
+        } 
+      }
+
+      
+      if (videoDurationUs-bufferedEndTimeUs<500000){
+        if(!allChunksLoaded){
+          long totalBytes=0;
+          for(long chunk_key: chunksByte.keySet()){
+            totalBytes+=chunksByte.get(chunk_key);
+          }
+          reportTotalBytes(totalBytes);
+        }
+        allChunksLoaded=true;
+      }
+      
+      
+      Format current = evaluation.format;
+
+      if(current!=null){
+          Log.e("ashkan_video", "buffer duration: "+bufferedDurationUs/1000+" current bitrate: "+current.bitrate);
+      }
+      
+      Format ideal = determineIdealFormat(formats, bandwidthMeter.getBitrateEstimate());
+      boolean isHigher = ideal != null && current != null && ideal.bitrate > current.bitrate;
+      boolean isLower = ideal != null && current != null && ideal.bitrate < current.bitrate;
+      if (isHigher) {
+        if (bufferedDurationUs < minDurationForQualityIncreaseUs) {
+          // The ideal format is a higher quality, but we have insufficient buffer to
+          // safely switch up. Defer switching up for now.
+          ideal = current;
+        } else if (bufferedDurationUs >= minDurationToRetainAfterDiscardUs) {
+          // We're switching from an SD stream to a stream of higher resolution. Consider
+          // discarding already buffered media chunks. Specifically, discard media chunks starting
+          // from the first one that is of lower bandwidth, lower resolution and that is not HD.
+          for (int i = 1; i < queue.size(); i++) {
+            MediaChunk thisChunk = queue.get(i);
+            long durationBeforeThisSegmentUs = thisChunk.startTimeUs - playbackPositionUs;
+            if (durationBeforeThisSegmentUs >= minDurationToRetainAfterDiscardUs
+                && thisChunk.format.bitrate < ideal.bitrate
+                && thisChunk.format.height < ideal.height
+                && thisChunk.format.height < 720
+                && thisChunk.format.width < 1280) {
+              // Discard chunks from this one onwards.
+              evaluation.queueSize = i;
+              break;
+            }
+          }
+        }
+      } else if (isLower && current != null
+        && bufferedDurationUs >= maxDurationForQualityDecreaseUs) {
+        // The ideal format is a lower quality, but we have sufficient buffer to defer switching
+        // down for now.
+        ideal = current;
+      }
+      if (current != null && ideal != current) {
+        evaluation.trigger = FormatEvaluator.TRIGGER_ADAPTIVE;
+        Log.e("ashkan_video", current.bitrate+"->"+ideal.bitrate);
+      }
+      evaluation.format = ideal;
+    }
+
+    /**
+     * Compute the ideal format ignoring buffer health.
+     */
+    protected Format determineIdealFormat(Format[] formats, long bitrateEstimate) {
+      long effectiveBitrate = computeEffectiveBitrateEstimate(bitrateEstimate);
+      int idx = formats.length - 1;
+      for (int i = 0; i < formats.length; i++) {
+        Format format = formats[i];
+        if (format.bitrate <= effectiveBitrate) {
+          idx = i;
+          break;
+//          return format;
+        }
+      }
+      // Calculate the scale-down birate.
+      int scaledBitrate = (int)(formats[idx].bitrate * scale);
+      // Find the maximum bitrate that is smaller than the scale-down rate.
+      // In case that we may intentionally select a higher bitrate, the iteration
+      // starts from the largest bitrate(idx 0).
+      for (int i = 0; i < formats.length; i++) {
+        if (formats[i].bitrate <= scaledBitrate) {
+          return formats[i];
+        }
+      }
+      // We didn't manage to calculate a suitable format. Return the lowest quality format.
+      // The minimum bitrate is still larger than the scale-down rate.
+      // Just use the minimum rate
+      return formats[formats.length-1];
+    }
+
+    /**
+     * Apply overhead factor, or default value in absence of estimate.
+     */
+    protected long computeEffectiveBitrateEstimate(long bitrateEstimate) {
+      return bitrateEstimate == BandwidthMeter.NO_ESTIMATE
+          ? maxInitialBitrate : (long) (bitrateEstimate * bandwidthFraction);
+    }
+    
+    private void reportTotalBytes(final long totalBytes){
+      if (eventHandler != null && eventListener != null) {
+        eventHandler.post(new Runnable()  {
+          @Override
+          public void run() {
+            eventListener.onAllChunksDownloaded(totalBytes);
+          }
+        });
+      }
+    }
+
+  }
   
   public static class BufferBasedAdaptiveEvaluator implements FormatEvaluator {
     
@@ -482,7 +705,7 @@ public interface FormatEvaluator {
         
     }
     
-    private int bitrateToFormatIndex(int bitrate, Format[] formats){
+    protected int bitrateToFormatIndex(int bitrate, Format[] formats){
         for(int i=0;i<formats.length;i++){
             if(bitrate==formats[i].bitrate){
                 return i;
@@ -491,12 +714,12 @@ public interface FormatEvaluator {
         return -1;
     }
     
-    private Format determineBufferBasedIdealFormat(Format[] formats, Format current,
+    protected Format determineBufferBasedIdealFormat(Format[] formats, Format current,
             long bufferedDurationUs) {
         return formats[bufferOccupancyToFormatIndex(formats.length, bufferedDurationUs)];
     }
     
-    private Format determineCapacityBasedIdealFormat(Format[] formats, Format current, long bufferedDurationUs) {
+    protected Format determineCapacityBasedIdealFormat(Format[] formats, Format current, long bufferedDurationUs) {
         if(current==null){
             return formats[formats.length-1];
         }else if (bandwidthMeter.getBitrateEstimate()>bufferToStartupCoeff(bufferedDurationUs)*current.bitrate){
@@ -511,7 +734,7 @@ public interface FormatEvaluator {
     }
     
     //this is the f function, it converts the buffer occupancy to formats indexes (linear function). formats array is sorted from high bitrate to low bitrate
-    private int bufferOccupancyToFormatIndex(int formatsLen, long bufferedDurationUs){
+    protected int bufferOccupancyToFormatIndex(int formatsLen, long bufferedDurationUs){
         if(bufferedDurationUs<DEFAULT_RESERVOIR_DURATION_MS*1000){
             return formatsLen - 1;
         }else if(bufferedDurationUs>(DEFAULT_BUFFER_DURATION_MS*0.9*1000)){
@@ -556,6 +779,525 @@ public interface FormatEvaluator {
       }
     }
     
+  }
+
+//  public static class BufferBasedAdaptiveEvaluator implements FormatEvaluator {
+//    
+//    public static final int DEFAULT_BUFFER_DURATION_MS = 30000;
+//    public static final int DEFAULT_RESERVOIR_DURATION_MS = 10000;
+//    
+//    public enum BufferState {
+//        STARTUP_STATE, STEADY_STATE 
+//    }
+//    
+//    private BufferState bufferState;
+//    private final BandwidthMeter bandwidthMeter;
+//    
+//    //To check if we have to switch from startup to steady state 
+//    private long prevBufferDurationUs;
+//    
+//    //when the video approach the end and we have the whole chunks in the buffer, 
+//    //buffer occupancy starts decreasing, but it should not trigger f function to reduce
+//    // bandwidth
+//    private long videoDurationUs;
+//    private long startTime;
+//    private final Handler eventHandler;
+//    private final EventListener eventListener;
+//    private HashMap<Long, Long> chunksByte;
+//    private boolean allChunksLoaded;
+//    
+//    
+//    public interface EventListener {
+//      void onSwitchToSteadyState(long elapsedMs);
+//      void onAllChunksDownloaded(long totalBytes);
+//    }
+//      
+//    public BufferBasedAdaptiveEvaluator(BandwidthMeter bandwidthMeter, long videoDurationMs, Handler eventHandler, EventListener eventListener){
+//        this.bufferState=BufferState.STARTUP_STATE;
+//        this.bandwidthMeter=bandwidthMeter;
+//        this.prevBufferDurationUs=-1;
+//        this.videoDurationUs=videoDurationMs*1000;
+//        this.startTime=System.currentTimeMillis();
+//        this.eventHandler=eventHandler;
+//        this.eventListener=eventListener;
+//        this.chunksByte= new HashMap<Long, Long>();
+//        this.allChunksLoaded=false;
+//    }
+//      
+//    @Override
+//    public void enable() {
+//        
+//    }
+//
+//    @Override
+//    public void disable() {
+//        
+//    }
+//
+//    //Google Glass bitrates in formats array: 2235503 1119643 610891 247132 110307
+//    @Override
+//    public void evaluate(List<? extends MediaChunk> queue,
+//            long playbackPositionUs, Format[] formats, Evaluation evaluation) {
+//        long bufferedDurationUs = queue.isEmpty() ? 0
+//                : queue.get(queue.size() - 1).endTimeUs - playbackPositionUs;
+//        
+//        
+//        for(int i=0;i<queue.size();i++){
+////            Log.e("ashkan_video", "\t"+i+": "+queue.get(i).format.bitrate+" "+queue.get(i).startTimeUs/1000+" : "+queue.get(i).endTimeUs/1000+" "+queue.get(i).isLoadFinished());
+//          
+//          if(!chunksByte.containsKey(queue.get(i).startTimeUs)){
+//            chunksByte.put(queue.get(i).startTimeUs, queue.get(i).bytesLoaded());
+//          } 
+//        }
+//        
+//        
+//        
+//        long bufferedEndTimeUs = queue.isEmpty() ? 0
+//                : queue.get(queue.size() - 1).endTimeUs;
+//        
+//        Format current = evaluation.format;
+//        if(current!=null){
+//            Log.e("ashkan_video", "buffer duration: "+bufferedDurationUs/1000+" current bitrate: "+current.bitrate);
+//        }
+//        Format ideal;
+//        
+//        
+//        if(bufferState==BufferState.STARTUP_STATE){
+//            if(prevBufferDurationUs!=-1 && prevBufferDurationUs>bufferedDurationUs){
+//                bufferState=BufferState.STEADY_STATE;
+//                Log.e("ashkan_video", "switch to STEADY_STATE, prev: "+prevBufferDurationUs/1000);
+//                notifyStateChanged(System.currentTimeMillis()-startTime);
+//            }
+//            else if(determineBufferBasedIdealFormat(formats, current, bufferedDurationUs).bitrate>determineCapacityBasedIdealFormat(formats, current, bufferedDurationUs).bitrate){
+//                bufferState=BufferState.STEADY_STATE;
+//                Log.e("ashkan_video", "switch to STEADY_STATE");
+//                notifyStateChanged(System.currentTimeMillis()-startTime);
+//            }
+//        }
+//        prevBufferDurationUs=bufferedDurationUs;
+////        Log.e("ashkan_video", "buffer endtime: "+(bufferedEndTimeUs/1000)+" video end time: "+(videoDurationUs/1000));
+//        
+//        if (videoDurationUs-bufferedEndTimeUs<500000){
+//            ideal=current;
+//            if(!allChunksLoaded){
+//              long totalBytes=0;
+//              for(long chunk_key: chunksByte.keySet()){
+//                totalBytes+=chunksByte.get(chunk_key);
+//              }
+//              reportTotalBytes(totalBytes);
+//            }
+//            allChunksLoaded=true;
+////            Log.e("ashkan_video", "We have all the video in buffer!");
+//        }else{
+//            if(bufferState==BufferState.STARTUP_STATE){
+//                ideal = determineCapacityBasedIdealFormat(formats, current, bufferedDurationUs);
+//            }else{
+//                ideal = determineBufferBasedIdealFormat(formats, current, bufferedDurationUs);
+//            }
+//        }
+//
+//        if (current != null && ideal != current) {
+//            evaluation.trigger = FormatEvaluator.TRIGGER_ADAPTIVE;
+//            Log.e("ashkan_video", current.bitrate+"->"+ideal.bitrate);
+//        }
+//        evaluation.format = ideal;
+//        
+//    }
+//    
+//    private int bitrateToFormatIndex(int bitrate, Format[] formats){
+//        for(int i=0;i<formats.length;i++){
+//            if(bitrate==formats[i].bitrate){
+//                return i;
+//            }
+//        }
+//        return -1;
+//    }
+//    
+//    private Format determineBufferBasedIdealFormat(Format[] formats, Format current,
+//            long bufferedDurationUs) {
+//        return formats[bufferOccupancyToFormatIndex(formats.length, bufferedDurationUs)];
+//    }
+//    
+//    private Format determineCapacityBasedIdealFormat(Format[] formats, Format current, long bufferedDurationUs) {
+//        if(current==null){
+//            return formats[formats.length-1];
+//        }else if (bandwidthMeter.getBitrateEstimate()>bufferToStartupCoeff(bufferedDurationUs)*current.bitrate){
+//            int idealIndex=bitrateToFormatIndex(current.bitrate, formats)-1;
+//            if(idealIndex<0){
+//                return formats[0];
+//            }
+//            return formats[idealIndex];
+//        
+//        }
+//        return current;
+//    }
+//    
+//    //this is the f function, it converts the buffer occupancy to formats indexes (linear function). formats array is sorted from high bitrate to low bitrate
+//    private int bufferOccupancyToFormatIndex(int formatsLen, long bufferedDurationUs){
+//        if(bufferedDurationUs<DEFAULT_RESERVOIR_DURATION_MS*1000){
+//            return formatsLen - 1;
+//        }else if(bufferedDurationUs>(DEFAULT_BUFFER_DURATION_MS*0.9*1000)){
+//            return 0;
+//        }else{
+//            float bufferDurationIntervalUs=((DEFAULT_BUFFER_DURATION_MS-DEFAULT_RESERVOIR_DURATION_MS)/(formatsLen-1))*1000;
+//            Log.e("ashkan_video", "index: "+(formatsLen-2-((int)((bufferedDurationUs-(DEFAULT_RESERVOIR_DURATION_MS*1000))/bufferDurationIntervalUs))));
+//            
+//            return formatsLen-2-(int)((bufferedDurationUs-(DEFAULT_RESERVOIR_DURATION_MS*1000))/bufferDurationIntervalUs);
+//        }
+//    }
+//    
+//    //this is described in section 6 and it is for start-up phase
+//    private int bufferToStartupCoeff(long bufferedDurationUs){
+//        if(bufferedDurationUs>DEFAULT_BUFFER_DURATION_MS*0.9*1000){
+//            return 2;
+//        }else if(bufferedDurationUs>DEFAULT_RESERVOIR_DURATION_MS*1000){
+//            return 4;
+//        }else{
+//            return 8;
+//        }
+//    }
+//    private void notifyStateChanged(final long elapsedTimeMs){
+//      if (eventHandler != null && eventListener != null) {
+//        eventHandler.post(new Runnable()  {
+//          @Override
+//          public void run() {
+//            eventListener.onSwitchToSteadyState(elapsedTimeMs);
+//          }
+//        });
+//      }
+//    }
+//    
+//    private void reportTotalBytes(final long totalBytes){
+//      if (eventHandler != null && eventListener != null) {
+//        eventHandler.post(new Runnable()  {
+//          @Override
+//          public void run() {
+//            eventListener.onAllChunksDownloaded(totalBytes);
+//          }
+//        });
+//      }
+//    }
+//    
+//  }
+
+
+//  public static class ScaledBufferBasedAdaptiveEvaluator extends BufferBasedAdaptiveEvaluator {
+//    private double scale;
+//    
+//    public ScaledBufferBasedAdaptiveEvaluator(BandwidthMeter bandwidthMeter, double scale, long videoDurationMs, Handler eventHandler, EventListener eventListener){
+//      super (bandwidthMeter, videoDurationMs, eventHandler, eventListener);
+//      this.scale = scale;
+//    }
+//
+//    
+//    protected int bitrateToFormatIndex(int bitrate, Format[] formats){
+//      // Calculate the scale-down birate.
+//      int scaledBitrate = (int)(bitrate * scale);
+//      // Find the maximum bitrate that is smaller than the scale-down rate.
+//      // In case that we may intentionally select a higher bitrate, the iteration
+//      // starts from the largest bitrate(idx 0).
+//        for(int i=0;i<formats.length;i++){
+//            if(formats[i].bitrate <= scaledBitrate){
+//                return i;
+//            }
+//        }
+//        // The minimum bitrate is still larger than the scale-down rate.
+//        // Just use the minimum rate
+//        return formats.length-1;
+//    }
+//    
+//    protected Format determineBufferBasedIdealFormat(Format[] formats, Format current,
+//            long bufferedDurationUs) {
+//      int idx = bufferOccupancyToFormatIndex(formats.length, bufferedDurationUs);
+//      // Calculate the scale-down birate.
+//      int scaledBitrate = (int)(formats[idx].bitrate * scale);
+//      // Find the maximum bitrate that is smaller than the scale-down rate.
+//      // In case that we may intentionally select a higher bitrate, the iteration
+//      // starts from the largest bitrate(idx 0).
+//      for (int i = 0; i < formats.length; i++) {
+//        if (formats[i].bitrate <= scaledBitrate) {
+//          return formats[i];
+//        }
+//      }
+//      // The minimum bitrate is still larger than the scale-down rate.
+//      // Just use the minimum rate
+//      return formats[formats.length-1];
+//    }
+//    
+//    //this is the f function, it converts the buffer occupancy to formats indexes (linear function). formats array is sorted from high bitrate to low bitrate
+//    protected int bufferOccupancyToFormatIndex(int formatsLen, long bufferedDurationUs){
+//        if(bufferedDurationUs<DEFAULT_RESERVOIR_DURATION_MS*1000){
+//            return formatsLen - 1;
+//        }else if(bufferedDurationUs>(DEFAULT_BUFFER_DURATION_MS*0.9*1000)){
+//            return 0;
+//        }else{
+//            float bufferDurationIntervalUs=((DEFAULT_BUFFER_DURATION_MS-DEFAULT_RESERVOIR_DURATION_MS)/(formatsLen-1))*1000;
+//            int bitrateIdx = (int)(scale * (formatsLen-2-((int)
+//                ((bufferedDurationUs-(DEFAULT_RESERVOIR_DURATION_MS*1000))
+//                    /bufferDurationIntervalUs))));
+//            Log.e("ashkan_video", "index: "+bitrateIdx);
+//            
+//            return bitrateIdx;
+//        }
+//    }
+//
+//
+//    
+//  }
+
+
+  
+  public static class ScaledBufferBasedAdaptiveEvaluator implements FormatEvaluator {
+    
+    public static final int DEFAULT_BUFFER_DURATION_MS = 30000;
+    public static final int DEFAULT_RESERVOIR_DURATION_MS = 10000;
+    
+    public enum BufferState {
+        STARTUP_STATE, STEADY_STATE 
+    }
+    
+    private int bufferDurationMs;
+    private int reservoirDurationMs;
+    private BufferState bufferState;
+    private final BandwidthMeter bandwidthMeter;
+    
+    //To check if we have to switch from startup to steady state 
+    private long prevBufferDurationUs;
+    
+    //when the video approach the end and we have the whole chunks in the buffer, 
+    //buffer occupancy starts decreasing, but it should not trigger f function to reduce
+    // bandwidth
+    private long videoDurationUs;
+    private long startTime;
+    private final Handler eventHandler;
+    private final EventListener eventListener;
+    private HashMap<Long, Long> chunksByte;
+    private boolean allChunksLoaded;
+    
+    private double scale = 0.0;
+    
+    public interface EventListener {
+      void onSwitchToSteadyState(long elapsedMs);
+      void onAllChunksDownloaded(long totalBytes);
+      void onBufferLoadChanged(long bufferDurationMs);
+    }
+      
+    public ScaledBufferBasedAdaptiveEvaluator(BandwidthMeter bandwidthMeter,
+        double scale, long videoDurationMs, Handler eventHandler,
+        EventListener eventListener, int bufferDurationMs, int reserviorDurationMs){
+      this(bandwidthMeter, scale, videoDurationMs, eventHandler, eventListener);
+      this.bufferDurationMs = bufferDurationMs;
+      this.reservoirDurationMs = reserviorDurationMs;
+    }
+    public ScaledBufferBasedAdaptiveEvaluator(BandwidthMeter bandwidthMeter, double scale, long videoDurationMs, Handler eventHandler, EventListener eventListener){
+        this.bufferState=BufferState.STARTUP_STATE;
+        this.bandwidthMeter=bandwidthMeter;
+        this.scale = scale;
+        this.prevBufferDurationUs=-1;
+        this.videoDurationUs=videoDurationMs*1000;
+        this.startTime=System.currentTimeMillis();
+        this.eventHandler=eventHandler;
+        this.eventListener=eventListener;
+        this.chunksByte= new HashMap<Long, Long>();
+        this.allChunksLoaded=false;
+        this.bufferDurationMs = DEFAULT_BUFFER_DURATION_MS;
+        this.reservoirDurationMs = DEFAULT_RESERVOIR_DURATION_MS;
+    }
+      
+    @Override
+    public void enable() {
+        
+    }
+
+    @Override
+    public void disable() {
+        
+    }
+
+    //Google Glass bitrates in formats array: 2235503 1119643 610891 247132 110307
+    @Override
+    public void evaluate(List<? extends MediaChunk> queue,
+            long playbackPositionUs, Format[] formats, Evaluation evaluation) {
+        long bufferedDurationUs = queue.isEmpty() ? 0
+                : queue.get(queue.size() - 1).endTimeUs - playbackPositionUs;
+        notifyBufferLoadChanged(bufferedDurationUs / 1000);
+        
+        for(int i=0;i<queue.size();i++){
+//            Log.e("ashkan_video", "\t"+i+": "+queue.get(i).format.bitrate+" "+queue.get(i).startTimeUs/1000+" : "+queue.get(i).endTimeUs/1000+" "+queue.get(i).isLoadFinished());
+          
+          if(!chunksByte.containsKey(queue.get(i).startTimeUs)){
+            chunksByte.put(queue.get(i).startTimeUs, queue.get(i).bytesLoaded());
+          } 
+        }
+        
+        
+        
+        long bufferedEndTimeUs = queue.isEmpty() ? 0
+                : queue.get(queue.size() - 1).endTimeUs;
+        
+        Format current = evaluation.format;
+        if(current!=null){
+            Log.e("ashkan_video", "buffer duration: "+bufferedDurationUs/1000+" current bitrate: "+current.bitrate);
+        }
+        Format ideal;
+        
+        
+        if(bufferState==BufferState.STARTUP_STATE){
+            if(prevBufferDurationUs!=-1 && prevBufferDurationUs>bufferedDurationUs){
+                bufferState=BufferState.STEADY_STATE;
+                Log.e("ashkan_video", "switch to STEADY_STATE, prev: "+prevBufferDurationUs/1000);
+                notifyStateChanged(System.currentTimeMillis()-startTime);
+            }
+            else if(determineBufferBasedIdealFormat(formats, current, bufferedDurationUs).bitrate>determineCapacityBasedIdealFormat(formats, current, bufferedDurationUs).bitrate){
+                bufferState=BufferState.STEADY_STATE;
+                Log.e("ashkan_video", "switch to STEADY_STATE");
+                notifyStateChanged(System.currentTimeMillis()-startTime);
+            }
+        }
+        prevBufferDurationUs=bufferedDurationUs;
+//        Log.e("ashkan_video", "buffer endtime: "+(bufferedEndTimeUs/1000)+" video end time: "+(videoDurationUs/1000));
+        
+//        if (videoDurationUs-bufferedEndTimeUs<500000){
+//            ideal=current;
+//            if(!allChunksLoaded){
+//              long totalBytes=0;
+//              for(long chunk_key: chunksByte.keySet()){
+//                totalBytes+=chunksByte.get(chunk_key);
+//              }
+//              reportTotalBytes(totalBytes);
+//            }
+//            allChunksLoaded=true;
+////            Log.e("ashkan_video", "We have all the video in buffer!");
+//        }else{
+//            if(bufferState==BufferState.STARTUP_STATE){
+//                ideal = determineCapacityBasedIdealFormat(formats, current, bufferedDurationUs);
+//            }else{
+//                ideal = determineBufferBasedIdealFormat(formats, current, bufferedDurationUs);
+//            }
+//        }
+        if(bufferState==BufferState.STARTUP_STATE){
+          ideal = determineCapacityBasedIdealFormat(formats, current, bufferedDurationUs);
+        }else{
+          ideal = determineBufferBasedIdealFormat(formats, current, bufferedDurationUs);
+        }
+
+
+        if (current != null && ideal != current) {
+            evaluation.trigger = FormatEvaluator.TRIGGER_ADAPTIVE;
+            Log.e("ashkan_video", current.bitrate+"->"+ideal.bitrate);
+        }
+        evaluation.format = ideal;
+        
+    }
+    
+    private int bitrateToFormatIndex(int bitrate, Format[] formats){
+      // Calculate the scale-down birate.
+      int scaledBitrate = (int)(bitrate * scale);
+      // Find the maximum bitrate that is smaller than the scale-down rate.
+      // In case that we may intentionally select a higher bitrate, the iteration
+      // starts from the largest bitrate(idx 0).
+        for(int i=0;i<formats.length;i++){
+            if(formats[i].bitrate <= scaledBitrate){
+                return i;
+            }
+        }
+        // The minimum bitrate is still larger than the scale-down rate.
+        // Just use the minimum rate
+        return formats.length-1;
+    }
+    
+    private Format determineBufferBasedIdealFormat(Format[] formats, Format current,
+            long bufferedDurationUs) {
+      int idx = bufferOccupancyToFormatIndex(formats.length, bufferedDurationUs);
+      // Calculate the scale-down birate.
+      int scaledBitrate = (int)(formats[idx].bitrate * scale);
+      // Find the maximum bitrate that is smaller than the scale-down rate.
+      // In case that we may intentionally select a higher bitrate, the iteration
+      // starts from the largest bitrate(idx 0).
+      for (int i = 0; i < formats.length; i++) {
+        if (formats[i].bitrate <= scaledBitrate) {
+          return formats[i];
+        }
+      }
+      // The minimum bitrate is still larger than the scale-down rate.
+      // Just use the minimum rate
+      return formats[formats.length-1];
+    }
+    
+    private Format determineCapacityBasedIdealFormat(Format[] formats, Format current, long bufferedDurationUs) {
+        if(current==null){
+            return formats[formats.length-1];
+        }else if (bandwidthMeter.getBitrateEstimate()>bufferToStartupCoeff(bufferedDurationUs)*current.bitrate){
+          // Ashkan, why you minus 1 here?
+            int idealIndex=bitrateToFormatIndex(current.bitrate, formats)-1;
+            if(idealIndex<0){
+                return formats[0];
+            }
+            return formats[idealIndex];
+        
+        }
+        return current;
+    }
+    
+    //this is the f function, it converts the buffer occupancy to formats indexes (linear function). formats array is sorted from high bitrate to low bitrate
+    private int bufferOccupancyToFormatIndex(int formatsLen, long bufferedDurationUs){
+        if(bufferedDurationUs<this.reservoirDurationMs*1000){
+            return formatsLen - 1;
+        }else if(bufferedDurationUs>(this.bufferDurationMs*0.9*1000)){
+            return 0;
+        }else{
+            float bufferDurationIntervalUs=((this.bufferDurationMs-this.reservoirDurationMs)/(formatsLen-1))*1000;
+            int bitrateIdx = (int)(scale * (formatsLen-2-((int)
+                ((bufferedDurationUs-(this.reservoirDurationMs*1000))
+                    /bufferDurationIntervalUs))));
+            Log.e("ashkan_video", "index: "+bitrateIdx);
+            
+            return bitrateIdx;
+        }
+    }
+    
+    //this is described in section 6 and it is for start-up phase
+    private int bufferToStartupCoeff(long bufferedDurationUs){
+        if(bufferedDurationUs>DEFAULT_BUFFER_DURATION_MS*0.9*1000){
+            return 2;
+        }else if(bufferedDurationUs>DEFAULT_RESERVOIR_DURATION_MS*1000){
+            return 4;
+        }else{
+            return 8;
+        }
+    }
+    private void notifyStateChanged(final long elapsedTimeMs){
+      if (eventHandler != null && eventListener != null) {
+        eventHandler.post(new Runnable()  {
+          @Override
+          public void run() {
+            eventListener.onSwitchToSteadyState(elapsedTimeMs);
+          }
+        });
+      }
+    }
+    
+    private void reportTotalBytes(final long totalBytes){
+      if (eventHandler != null && eventListener != null) {
+        eventHandler.post(new Runnable()  {
+          @Override
+          public void run() {
+            eventListener.onAllChunksDownloaded(totalBytes);
+          }
+        });
+      }
+    }
+    
+    private void notifyBufferLoadChanged(final long bufferDurationMs) {
+      if (eventHandler != null && eventListener != null) {
+        eventHandler.post(new Runnable() {
+          @Override
+          public void run() {
+            eventListener.onBufferLoadChanged(bufferDurationMs);
+          }
+        });
+      }
+    }
   }
 
 

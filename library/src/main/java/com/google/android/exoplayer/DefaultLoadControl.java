@@ -19,6 +19,7 @@ import com.google.android.exoplayer.upstream.Allocator;
 import com.google.android.exoplayer.upstream.NetworkLock;
 
 import android.os.Handler;
+import android.util.Log;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -63,6 +64,7 @@ public class DefaultLoadControl implements LoadControl {
   private static final int ABOVE_HIGH_WATERMARK = 0;
   private static final int BETWEEN_WATERMARKS = 1;
   private static final int BELOW_LOW_WATERMARK = 2;
+  private static final String TAG = "DefaultLoadControl";
 
   private final Allocator allocator;
   private final List<Object> loaders;
@@ -166,10 +168,15 @@ public class DefaultLoadControl implements LoadControl {
     // Update the loader state.
     int loaderBufferState = getLoaderBufferState(playbackPositionUs, nextLoadPositionUs);
     LoaderState loaderState = loaderStates.get(loader);
+    // *** buffer state changed if or 1) buffer occupancy changed 2) next chunk is requested
+    // *** 3) loading and failed state changed
     boolean loaderStateChanged = loaderState.bufferState != loaderBufferState ||
         loaderState.nextLoadPositionUs != nextLoadPositionUs || loaderState.loading != loading ||
         loaderState.failed != failed;
     if (loaderStateChanged) {
+      Log.e("hongyi_video", "Loader Watermark state: " + 
+          (loaderBufferState == ABOVE_HIGH_WATERMARK ? ">HW" :
+            (loaderBufferState == BETWEEN_WATERMARKS ? "<HW && >LW" : "<LW")));
       loaderState.bufferState = loaderBufferState;
       loaderState.nextLoadPositionUs = nextLoadPositionUs;
       loaderState.loading = loading;
@@ -181,6 +188,9 @@ public class DefaultLoadControl implements LoadControl {
     int bufferPoolState = getBufferPoolState(allocatedSize);
     boolean bufferPoolStateChanged = this.bufferPoolState != bufferPoolState;
     if (bufferPoolStateChanged) {
+      Log.e("hongyi_video", "Buffer size state: " + 
+          (bufferPoolState == ABOVE_HIGH_WATERMARK ? ">HW" :
+            (bufferPoolState == BETWEEN_WATERMARKS ? "<HW && >LW" : "<LW")));
       this.bufferPoolState = bufferPoolState;
     }
 
@@ -189,6 +199,8 @@ public class DefaultLoadControl implements LoadControl {
       updateControlState();
     }
 
+    // *** Allow downloading when 1) allocated buffer is smaller than allowed size
+    // *** 2) next load is valid 3) maxLoadStart is larger than next (fillingbuffer allowed)
     return allocatedSize < targetBufferSize && nextLoadPositionUs != -1
         && nextLoadPositionUs <= maxLoadStartPositionUs;
   }
@@ -198,6 +210,7 @@ public class DefaultLoadControl implements LoadControl {
       return ABOVE_HIGH_WATERMARK;
     } else {
       long timeUntilNextLoadPosition = nextLoadPositionUs - playbackPositionUs;
+//      Log.e(TAG, "Buffer duration: " + timeUntilNextLoadPosition / 1000000);
       return timeUntilNextLoadPosition > highWatermarkUs ? ABOVE_HIGH_WATERMARK :
           timeUntilNextLoadPosition < lowWatermarkUs ? BELOW_LOW_WATERMARK :
           BETWEEN_WATERMARKS;
@@ -206,6 +219,7 @@ public class DefaultLoadControl implements LoadControl {
 
   private int getBufferPoolState(int allocatedSize) {
     float bufferPoolLoad = (float) allocatedSize / targetBufferSize;
+//    Log.e(TAG, "Buffer utilization: " + bufferPoolLoad);
     return bufferPoolLoad > highPoolLoad ? ABOVE_HIGH_WATERMARK :
         bufferPoolLoad < lowPoolLoad ? BELOW_LOW_WATERMARK :
         BETWEEN_WATERMARKS;
@@ -224,6 +238,9 @@ public class DefaultLoadControl implements LoadControl {
       highestState = Math.max(highestState, loaderState.bufferState);
     }
 
+    // *** whether start downloading new video content
+    // *** Conditions: 1. below low water mark 2. between watermarks and previously downloading
+    // *** Assert: if previous above high water mark, then it will not downloading until below low wm
     fillingBuffers = !loaders.isEmpty() && !finished && !failed
         && (highestState == BELOW_LOW_WATERMARK
         || (highestState == BETWEEN_WATERMARKS && fillingBuffers));
