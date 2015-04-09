@@ -24,6 +24,7 @@ import android.media.MediaCodec;
 import android.media.MediaCrypto;
 import android.os.Handler;
 import android.os.SystemClock;
+import android.util.Log;
 import android.view.Surface;
 
 import java.nio.ByteBuffer;
@@ -100,6 +101,8 @@ public class MediaCodecVideoTrackRenderer extends MediaCodecTrackRenderer {
   private int currentHeight;
   private int lastReportedWidth;
   private int lastReportedHeight;
+  // Hongyi: mark each processed frame
+  private int frameCount;
 
   /**
    * @param source The upstream source from which the renderer obtains samples.
@@ -257,6 +260,8 @@ public class MediaCodecVideoTrackRenderer extends MediaCodecTrackRenderer {
   protected void onStarted() {
     super.onStarted();
     droppedFrameCount = 0;
+    // Hongyi: mark each processed frame
+    frameCount = 0;
     droppedFrameAccumulationStartTimeMs = SystemClock.elapsedRealtime();
   }
 
@@ -341,11 +346,17 @@ public class MediaCodecVideoTrackRenderer extends MediaCodecTrackRenderer {
   protected boolean processOutputBuffer(long timeUs, MediaCodec codec, ByteBuffer buffer,
       MediaCodec.BufferInfo bufferInfo, int bufferIndex, boolean shouldSkip) {
     if (shouldSkip) {
+//      Log.e("HongyiVideoCodec", "Dequeue(Skip) " + bufferInfo.presentationTimeUs / 1000 +
+//          ": " + System.currentTimeMillis() + ", " + timeUs / 1000 + ", early: " +
+//          (bufferInfo.presentationTimeUs - timeUs) / 1000);
       skipOutputBuffer(codec, bufferIndex);
       return true;
     }
 
     long earlyUs = bufferInfo.presentationTimeUs - timeUs;
+//    Log.e("HongyiVideoCodec", "Dequeue " + bufferInfo.presentationTimeUs / 1000 +
+//        ": " + System.currentTimeMillis() + ", " + timeUs / 1000 + ", early: " +
+//        (bufferInfo.presentationTimeUs - timeUs) / 1000);
     if (earlyUs < -30000) {
       // We're more than 30ms late rendering the frame.
       dropOutputBuffer(codec, bufferIndex);
@@ -378,6 +389,9 @@ public class MediaCodecVideoTrackRenderer extends MediaCodecTrackRenderer {
   }
 
   private void skipOutputBuffer(MediaCodec codec, int bufferIndex) {
+    // Hongyi: mark each processed frame
+    frameCount++;
+    
     TraceUtil.beginSection("skipVideoBuffer");
     codec.releaseOutputBuffer(bufferIndex, false);
     TraceUtil.endSection();
@@ -385,21 +399,29 @@ public class MediaCodecVideoTrackRenderer extends MediaCodecTrackRenderer {
   }
 
   private void dropOutputBuffer(MediaCodec codec, int bufferIndex) {
+    // Hongyi: mark each processed frame
+    frameCount++;
+    
     TraceUtil.beginSection("dropVideoBuffer");
     codec.releaseOutputBuffer(bufferIndex, false);
     TraceUtil.endSection();
     codecCounters.droppedOutputBufferCount++;
     droppedFrameCount++;
+    Log.e("HongyiVideoCodec", System.currentTimeMillis() + " Frame " + frameCount + " is dropped!");
     if (droppedFrameCount == maxDroppedFrameCountToNotify) {
       notifyAndResetDroppedFrameCount();
     }
   }
 
   private void renderOutputBuffer(MediaCodec codec, int bufferIndex) {
+    // Hongyi: mark each processed frame
+    frameCount++;
+    
     if (lastReportedWidth != currentWidth || lastReportedHeight != currentHeight) {
       lastReportedWidth = currentWidth;
       lastReportedHeight = currentHeight;
       notifyVideoSizeChanged(currentWidth, currentHeight);
+      Log.e("HongyiVideoCodec", System.currentTimeMillis() + " Frame " + frameCount + ": size change " + currentWidth + ":" + currentHeight);
     }
     TraceUtil.beginSection("renderVideoBuffer");
     codec.releaseOutputBuffer(bufferIndex, true);

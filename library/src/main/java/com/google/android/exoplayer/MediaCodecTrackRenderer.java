@@ -26,6 +26,7 @@ import android.media.MediaCrypto;
 import android.media.MediaExtractor;
 import android.os.Handler;
 import android.os.SystemClock;
+import android.util.Log;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -58,6 +59,7 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
      */
     void onCryptoError(CryptoException e);
 
+    void onCodecChange(MediaFormat oldFormat, MediaFormat newFormat, long startTs, long endTs);
   }
 
   /**
@@ -402,9 +404,11 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
         }
         if (codec != null) {
           while (drainOutputBuffer(timeUs)) {}
+          long startTs = System.currentTimeMillis();
           if (feedInputBuffer(true)) {
             while (feedInputBuffer(false)) {}
           }
+          Log.e("HongyiVideoCodec", "Feed input delay: " + (System.currentTimeMillis() - startTs));
         }
       }
       codecCounters.ensureUpdated();
@@ -487,6 +491,7 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
     }
 
     int result;
+    
     if (waitingForKeys) {
       // We've already read an encrypted sample into sampleHolder, and are waiting for keys.
       result = SampleSource.SAMPLE_READ;
@@ -505,12 +510,14 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
         sourceState = SOURCE_STATE_READY_READ_MAY_FAIL;
       }
     }
+    long readDataEndTs = System.currentTimeMillis();
 
     if (result == SampleSource.NOTHING_READ) {
       return false;
     }
     if (result == SampleSource.DISCONTINUITY_READ) {
       flushCodec();
+      Log.e("HongyiVideoCodec", "    flush codec: " + (System.currentTimeMillis() - readDataEndTs));
       return true;
     }
     if (result == SampleSource.FORMAT_READ) {
@@ -521,6 +528,7 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
         codecReconfigurationState = RECONFIGURATION_STATE_WRITE_PENDING;
       }
       onInputFormatChanged(formatHolder);
+      Log.e("HongyiVideoCodec", "    input format changed: " + (System.currentTimeMillis() - readDataEndTs));
       return true;
     }
     if (result == SampleSource.END_OF_STREAM) {
@@ -539,6 +547,7 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
         notifyCryptoError(e);
         throw new ExoPlaybackException(e);
       }
+      Log.e("HongyiVideoCodec", "    end of stream: " + (System.currentTimeMillis() - readDataEndTs));
       return false;
     }
     if (waitingForFirstSyncFrame) {
@@ -551,6 +560,7 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
           // data into a subsequent buffer (if there is one).
           codecReconfigurationState = RECONFIGURATION_STATE_WRITE_PENDING;
         }
+        Log.e("HongyiVideoCodec", "    sync missing: " + (System.currentTimeMillis() - readDataEndTs));
         return true;
       }
       waitingForFirstSyncFrame = false;
@@ -558,6 +568,7 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
     boolean sampleEncrypted = (sampleHolder.flags & MediaExtractor.SAMPLE_FLAG_ENCRYPTED) != 0;
     waitingForKeys = shouldWaitForKeys(sampleEncrypted);
     if (waitingForKeys) {
+      Log.e("HongyiVideoCodec", "    wait for key frame: " + (System.currentTimeMillis() - readDataEndTs));
       return false;
     }
     try {
@@ -572,6 +583,7 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
             adaptiveReconfigurationBytes);
         codec.queueSecureInputBuffer(inputIndex, 0, cryptoInfo, presentationTimeUs, 0);
       } else {
+//        Log.e("HongyiVideoCodec", "Enqueue " + presentationTimeUs / 1000 + ": " + System.currentTimeMillis());
         codec.queueInputBuffer(inputIndex, 0 , bufferSize, presentationTimeUs, 0);
       }
       inputIndex = -1;
@@ -628,11 +640,33 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
       codecReconfigured = true;
       codecReconfigurationState = RECONFIGURATION_STATE_WRITE_PENDING;
     } else {
+      long startTs = System.currentTimeMillis();
       releaseCodec();
       maybeInitCodec();
+      long endTs = System.currentTimeMillis();
+      notifyCodecChange(oldFormat, format, startTs, endTs);
     }
+    
+    // Hongyi: log new format size
+//
+//    android.media.MediaFormat tmpFormat = format;
+//    boolean hasCrop = format.containsKey(KEY_CROP_RIGHT) && format.containsKey(KEY_CROP_LEFT)
+//        && format.containsKey(KEY_CROP_BOTTOM) && format.containsKey(KEY_CROP_TOP);
+//    currentWidth = hasCrop
+//        ? format.getInteger(KEY_CROP_RIGHT) - format.getInteger(KEY_CROP_LEFT) + 1
+//        : format.getInteger(android.media.MediaFormat.KEY_WIDTH);
+//    currentHeight = hasCrop
+//        ? format.getInteger(KEY_CROP_BOTTOM) - format.getInteger(KEY_CROP_TOP) + 1
+//        : format.getInteger(android.media.MediaFormat.KEY_HEIGHT);
+    Log.e("HongyiVideoCodec", "New input format: " + format.width + ":" + format.height);
+    Log.e("HongyiVideoCodec", "Is codec adaptive? " + format.mimeType + ", " + codecIsAdaptive);
   }
 
+//  // TODO: Use MediaFormat constants if these get exposed through the API. See [redacted].
+//  private static final String KEY_CROP_LEFT = "crop-left";
+//  private static final String KEY_CROP_RIGHT = "crop-right";
+//  private static final String KEY_CROP_BOTTOM = "crop-bottom";
+//  private static final String KEY_CROP_TOP = "crop-top";
   /**
    * Invoked when the output format of the {@link MediaCodec} changes.
    * <p>
@@ -702,6 +736,11 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
       outputIndex = codec.dequeueOutputBuffer(outputBufferInfo, 0);
     }
 
+//    Log.e("HongyiVideoCodec", "Dequeue " + outputIndex + ": " + outputBufferInfo.presentationTimeUs / 1000 
+//        + ", " + timeUs / 1000 + ", early: " +
+//        (outputBufferInfo.presentationTimeUs - timeUs) / 1000 +
+//        ": " + System.currentTimeMillis() );
+    
     if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
       onOutputFormatChanged(codec.getOutputFormat());
       codecCounters.outputFormatChangedCount++;
@@ -775,4 +814,21 @@ public abstract class MediaCodecTrackRenderer extends TrackRenderer {
     }
   }
 
+
+  private void notifyCodecChange(final MediaFormat oldFormat, 
+      final MediaFormat newFormat, final long startTs, final long endTs) {
+    if (oldFormat != null && newFormat != null) {
+      Log.e("HongyiVideoCodec", "" + oldFormat.width + "*" + oldFormat.height +
+          " -> " + newFormat.width + "*" + newFormat.height + " : " +
+          " codec change delay: " + (endTs - startTs));
+    }
+    if (eventHandler != null && eventListener != null) {
+      eventHandler.post(new Runnable()  {
+        @Override
+        public void run() {
+          eventListener.onCodecChange(oldFormat, newFormat, startTs, endTs);
+        }
+      });
+    }
+  }
 }

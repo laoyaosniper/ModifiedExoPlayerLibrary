@@ -196,6 +196,12 @@ public interface FormatEvaluator {
       void onAllChunksDownloaded(long totalBytes);
     }
 
+    public AdaptiveEvaluator(BandwidthMeter bandwidthMeter) {
+      this (bandwidthMeter, DEFAULT_MAX_INITIAL_BITRATE,
+          DEFAULT_MIN_DURATION_FOR_QUALITY_INCREASE_MS,
+          DEFAULT_MAX_DURATION_FOR_QUALITY_DECREASE_MS,
+          DEFAULT_MIN_DURATION_TO_RETAIN_AFTER_DISCARD_MS, DEFAULT_BANDWIDTH_FRACTION, null, null);
+    }
     /**
      * @param bandwidthMeter Provides an estimate of the currently available bandwidth.
      */
@@ -1084,10 +1090,10 @@ public interface FormatEvaluator {
       
     public ScaledBufferBasedAdaptiveEvaluator(BandwidthMeter bandwidthMeter,
         double scale, long videoDurationMs, Handler eventHandler,
-        EventListener eventListener, int bufferDurationMs, int reserviorDurationMs){
+        EventListener eventListener, int reserviorDurationMs, int bufferDurationMs){
       this(bandwidthMeter, scale, videoDurationMs, eventHandler, eventListener);
-      this.bufferDurationMs = bufferDurationMs;
       this.reservoirDurationMs = reserviorDurationMs;
+      this.bufferDurationMs = bufferDurationMs;
     }
     public ScaledBufferBasedAdaptiveEvaluator(BandwidthMeter bandwidthMeter, double scale, long videoDurationMs, Handler eventHandler, EventListener eventListener){
         this.bufferState=BufferState.STARTUP_STATE;
@@ -1100,8 +1106,8 @@ public interface FormatEvaluator {
         this.eventListener=eventListener;
         this.chunksByte= new HashMap<Long, Long>();
         this.allChunksLoaded=false;
-        this.bufferDurationMs = DEFAULT_BUFFER_DURATION_MS;
         this.reservoirDurationMs = DEFAULT_RESERVOIR_DURATION_MS;
+        this.bufferDurationMs = DEFAULT_BUFFER_DURATION_MS;
     }
       
     @Override
